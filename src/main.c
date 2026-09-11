@@ -5,9 +5,16 @@
 #include <pspctrl.h>
 #include <pspaudio.h>
 #include <stdio.h>
+#include <math.h>
 
 PSP_MODULE_INFO("LAST SHIFT", 0, 1, 0);
 PSP_MAIN_THREAD_ATTR(THREAD_ATTR_USER);
+
+#define PI 3.14159265f
+
+/* Fog and the cleared background share a color so distance dissolves into
+ * the same darkness the room ends in. */
+#define FOG_COLOR 0xFF1A0F08
 
 #define BUF_WIDTH 512
 #define SCR_WIDTH 480
@@ -68,6 +75,8 @@ static const Note snd_order_done[] = {{523, 80}, {659, 80}, {784, 140}, {0, 0}};
 static const Note snd_shift_done[] = {{523, 120}, {659, 120}, {784, 120}, {1046, 240}, {0, 0}};
 static const Note snd_menu[] = {{660, 35}, {0, 0}};
 static const Note snd_horror[] = {{147, 260}, {0, 90}, {110, 420}, {0, 0}};
+static const Note snd_battery[] = {{880, 40}, {1174, 70}, {0, 0}};
+static const Note snd_click[] = {{1500, 25}, {0, 0}};
 
 static int audio_channel = -1;
 static short audio_buffer[2][AUDIO_FRAMES * 2];
@@ -81,6 +90,82 @@ static int wave_phase = 0;
 void play_sound(const Note *sequence)
 {
     pending_sound = sequence;
+}
+
+/* ---- Ambient bed -------------------------------------------------------
+ *
+ * A slow drone rather than a tune: three detuned voices a fifth and an
+ * octave apart, each swelling on its own slow cycle so they drift in and
+ * out of phase and the pad never audibly loops. A little filtered noise
+ * underneath stands in for room tone. Synthesised for the same reason the
+ * textures are: no files to ship, and it can react to the game.
+ *
+ * Sine comes from a table; calling sinf per sample for several voices at
+ * 44 kHz would be the most expensive thing in the game. */
+
+#define SINE_TABLE_SIZE 256
+#define DRONE_VOICES 3
+
+static short sine_table[SINE_TABLE_SIZE];
+static unsigned int drone_phase[DRONE_VOICES];
+static unsigned int drone_step[DRONE_VOICES];
+static unsigned int swell_phase[DRONE_VOICES];
+static unsigned int swell_step[DRONE_VOICES];
+static int noise_lowpass = 0;
+
+/* Raised as the shift goes wrong; 1.0 is the normal night-shift hum. */
+static volatile float ambient_intensity = 1.0f;
+
+static unsigned int hz_to_step(float hz)
+{
+    return (unsigned int)(hz * 4294967296.0f / (float)SAMPLE_RATE);
+}
+
+void build_ambient(void)
+{
+    int i;
+    for (i = 0; i < SINE_TABLE_SIZE; i++)
+        sine_table[i] = (short)(sinf(2.0f * PI * i / SINE_TABLE_SIZE) * 32000.0f);
+
+    /* A, its fifth, and the octave below: an open drone with no third, so
+     * it stays ambiguous rather than sounding major or minor. */
+    drone_step[0] = hz_to_step(55.0f);
+    drone_step[1] = hz_to_step(82.5f);
+    drone_step[2] = hz_to_step(27.5f);
+
+    /* Deliberately unrelated periods so the swells never line up. */
+    swell_step[0] = hz_to_step(0.041f);
+    swell_step[1] = hz_to_step(0.029f);
+    swell_step[2] = hz_to_step(0.017f);
+}
+
+static int ambient_sample(void)
+{
+    int mixed = 0;
+    int v;
+
+    for (v = 0; v < DRONE_VOICES; v++)
+    {
+        drone_phase[v] += drone_step[v];
+        swell_phase[v] += swell_step[v];
+
+        int tone = sine_table[drone_phase[v] >> 24];
+        /* Swell rides from a quarter to full volume. */
+        int swell = sine_table[swell_phase[v] >> 24] + 32000;
+        mixed += (int)((long long)tone * swell >> 18);
+    }
+
+    /* Own generator rather than the one the textures use: this runs on the
+     * audio thread and must not share state with the game thread. */
+    static unsigned int audio_rng = 0x2468ACE1;
+    audio_rng = audio_rng * 1103515245u + 12345u;
+    int white = (int)((audio_rng >> 16) & 0x7FF) - 1024;
+
+    /* One-pole lowpass turns the hiss into a rumble. */
+    noise_lowpass += (white - noise_lowpass) >> 4;
+    mixed += noise_lowpass;
+
+    return (int)(mixed * 0.055f * ambient_intensity);
 }
 
 static void start_note(void)
@@ -131,8 +216,15 @@ static void fill_audio(short *buffer)
             }
         }
 
-        buffer[i * 2] = sample;
-        buffer[i * 2 + 1] = sample;
+        /* Effects sit on top of the drone; clamp so the sum can't wrap. */
+        int mixed = sample + ambient_sample();
+        if (mixed > 32767)
+            mixed = 32767;
+        else if (mixed < -32768)
+            mixed = -32768;
+
+        buffer[i * 2] = (short)mixed;
+        buffer[i * 2 + 1] = (short)mixed;
     }
 }
 
@@ -150,6 +242,8 @@ int audio_thread(SceSize args, void *argp)
 
 void audio_init(void)
 {
+    build_ambient();
+
     audio_channel = sceAudioChReserve(PSP_AUDIO_NEXT_CHANNEL, AUDIO_FRAMES,
                                        PSP_AUDIO_FORMAT_STEREO);
     if (audio_channel < 0)
@@ -204,12 +298,11 @@ void init_graphics(void)
     sceGuInit();
 
     sceGuStart(GU_DIRECT, list);
-    /* Single-buffered: draw and display share the same address, so the
-     * pspDebugScreen HUD text (written after the 3D frame) always lands
-     * in the buffer that's actually shown, with no double-buffer swap
-     * to fall out of sync with. */
+    /* Double-buffered: one frame is scanned out while the next is drawn.
+     * 0x88000 is exactly one 512x272x4 buffer, so the depth buffer follows
+     * both color buffers at 0x110000. */
     sceGuDrawBuffer(GU_PSM_8888, (void *)0, BUF_WIDTH);
-    sceGuDispBuffer(SCR_WIDTH, SCR_HEIGHT, (void *)0, BUF_WIDTH);
+    sceGuDispBuffer(SCR_WIDTH, SCR_HEIGHT, (void *)0x88000, BUF_WIDTH);
     sceGuDepthBuffer((void *)0x110000, BUF_WIDTH);
     sceGuOffset(2048 - (SCR_WIDTH / 2), 2048 - (SCR_HEIGHT / 2));
     sceGuViewport(2048, 2048, SCR_WIDTH, SCR_HEIGHT);
@@ -218,17 +311,53 @@ void init_graphics(void)
     sceGuEnable(GU_SCISSOR_TEST);
     sceGuDepthFunc(GU_LEQUAL);
     sceGuEnable(GU_DEPTH_TEST);
-    sceGuFrontFace(GU_CW);
+    /* Cube and floor faces are wound counter-clockwise as seen from outside,
+     * so culling the rest halves what the rasterizer touches. */
+    sceGuFrontFace(GU_CCW);
     /* Smooth shading lets the floor's baked light pools blend across tiles. */
     sceGuShadeModel(GU_SMOOTH);
-    sceGuDisable(GU_CULL_FACE);
-    sceGuDisable(GU_TEXTURE_2D);
+    sceGuEnable(GU_CULL_FACE);
+
+    /* MODULATE multiplies the texture by the vertex color, so per-face
+     * shading and baked lamp light survive texturing. */
+    sceGuTexMode(GU_PSM_8888, 0, 0, 0);
+    sceGuTexFunc(GU_TFX_MODULATE, GU_TCC_RGB);
+    sceGuTexFilter(GU_LINEAR, GU_LINEAR);
+    sceGuTexWrap(GU_REPEAT, GU_REPEAT);
+    sceGuTexScale(1.0f, 1.0f);
+    sceGuTexOffset(0.0f, 0.0f);
+    sceGuEnable(GU_TEXTURE_2D);
+
+    /* Distance fades into the dark rather than ending at a hard edge. */
+    sceGuFog(9.0f, 30.0f, FOG_COLOR);
+    sceGuEnable(GU_FOG);
+
     sceGuEnable(GU_CLIP_PLANES);
     sceGuFinish();
     sceGuSync(0, 0);
 
     sceDisplayWaitVblankStart();
     sceGuDisplay(GU_TRUE);
+}
+
+/* ---- Player state ------------------------------------------------------
+ *
+ * Declared up here because the flashlight is part of the lighting model and
+ * needs to know where the player is standing and which way they face. */
+
+static float player_x = 0.0f;
+static float player_z = 6.0f;
+static float player_angle = 0.0f; /* radians; 0 faces -Z */
+static float walk_phase = 0.0f;   /* drives the walk cycle */
+static float walk_amount = 0.0f;  /* 0 standing, 1 at full speed */
+
+/* Rotates a point from the player's local space into world space. At angle
+ * 0 the forward direction is -Z. */
+static void rotate_y(float lx, float lz, float angle, float *wx, float *wz)
+{
+    float c = cosf(angle), s = sinf(angle);
+    *wx = lx * c - lz * s;
+    *wz = lx * s + lz * c;
 }
 
 /* ---- Lighting ----------------------------------------------------------
@@ -239,16 +368,45 @@ void init_graphics(void)
  * cast real pools of light) and objects get it per face. Both feed the same
  * flat-colored vertex path that already works. */
 
-#define LAMP_COUNT 6
-static const float lamp_x[LAMP_COUNT] = {-6.0f, 6.0f, -6.0f, 6.0f, 0.0f, 0.0f};
-static const float lamp_z[LAMP_COUNT] = {-6.0f, -6.0f, 3.0f, 3.0f, -1.5f, 7.0f};
-static int lamp_on[LAMP_COUNT] = {1, 1, 1, 1, 1, 1};
+#define LAMP_COUNT 4
+static const float lamp_x[LAMP_COUNT] = {-6.0f, 6.0f, -6.0f, 6.0f};
+static const float lamp_z[LAMP_COUNT] = {-6.0f, -6.0f, 3.0f, 3.0f};
+static int lamp_on[LAMP_COUNT] = {1, 1, 1, 1};
+
+/* A lamp the shift's scripted events killed stays dead: the terminal did
+ * say maintenance wasn't scheduled. The breaker only brings back the ones
+ * that merely tripped. */
+static int lamp_dead[LAMP_COUNT] = {0, 0, 0, 0};
 
 static int terminal_glitched = 0;
 
-#define LIGHT_AMBIENT 0.20f
-#define LAMP_STRENGTH 1.10f
-#define LAMP_FALLOFF 0.05f
+/* Tuned so a spot directly under a lamp reaches full brightness while the
+ * middle of the floor sits near half and the corners fall away: with enough
+ * lamps or a weak falloff every point saturates and the room reads as
+ * uniformly flat. The ambient floor is low enough that the aisles between
+ * the lamps genuinely need the flashlight. */
+#define LIGHT_AMBIENT 0.06f
+#define LAMP_STRENGTH 0.78f
+#define LAMP_FALLOFF 0.17f
+
+/* Flashlight cone carried by the player. It runs on a battery, so the beam
+ * shortens and dims as the charge goes, and dies entirely at zero. */
+#define FLASH_RANGE 9.0f
+#define FLASH_STRENGTH 0.95f
+#define FLASH_COS 0.62f     /* cosine of the cone's half angle */
+#define FLASH_DRAIN 0.011f /* charge per second: a full battery lasts ~90s */
+
+static int flashlight_on = 1;
+static float flashlight_charge = 1.0f;
+
+/* Weak batteries still give some light, so running low is a warning rather
+ * than a cliff. */
+static float flashlight_power(void)
+{
+    if (!flashlight_on || flashlight_charge <= 0.0f)
+        return 0.0f;
+    return 0.35f + 0.65f * flashlight_charge;
+}
 
 float light_at(float x, float z)
 {
@@ -267,6 +425,42 @@ float light_at(float x, float z)
     return level > 1.0f ? 1.0f : level;
 }
 
+/* The lamps are static and can be baked; this cone moves every frame, so it
+ * is kept separate and added on top of the baked level. */
+float flashlight_at(float x, float z)
+{
+    float power = flashlight_power();
+    if (power <= 0.0f)
+        return 0.0f;
+
+    float range = FLASH_RANGE * power;
+    float dx = x - player_x;
+    float dz = z - player_z;
+    float d2 = dx * dx + dz * dz;
+    if (d2 > range * range)
+        return 0.0f;
+
+    float d = sqrtf(d2);
+    if (d < 0.01f)
+        return FLASH_STRENGTH * power;
+
+    float fx = sinf(player_angle);
+    float fz = -cosf(player_angle);
+    float alignment = (dx * fx + dz * fz) / d;
+    if (alignment < FLASH_COS)
+        return 0.0f;
+
+    float edge = (alignment - FLASH_COS) / (1.0f - FLASH_COS);
+    return FLASH_STRENGTH * power * edge * (1.0f - d / range);
+}
+
+/* What an object standing at (x,z) is actually lit by right now. */
+float lit_level(float x, float z)
+{
+    float level = light_at(x, z) + flashlight_at(x, z);
+    return level > 1.0f ? 1.0f : level;
+}
+
 /* Colors are ABGR; alpha is left alone. */
 unsigned int scale_color(unsigned int color, float k)
 {
@@ -276,9 +470,89 @@ unsigned int scale_color(unsigned int color, float k)
     return (color & 0xFF000000) | (b << 16) | (g << 8) | r;
 }
 
-/* Colored world vertex. */
+/* ---- Textures ----------------------------------------------------------
+ *
+ * Generated at boot instead of loaded: three small tiling surfaces cost a
+ * few dozen lines here and nothing on disk, and the game ships as a single
+ * EBOOT with no data files to find at runtime. They are modulated by the
+ * vertex color, so per-face shading and lamp light still come through. */
+
+#define TEX_SIZE 64
+/* World units covered by one repeat of a texture. */
+#define TEX_WORLD 2.0f
+
+static unsigned int __attribute__((aligned(16))) tex_cardboard[TEX_SIZE * TEX_SIZE];
+static unsigned int __attribute__((aligned(16))) tex_concrete[TEX_SIZE * TEX_SIZE];
+static unsigned int __attribute__((aligned(16))) tex_metal[TEX_SIZE * TEX_SIZE];
+
+static unsigned int rng_state = 0x13572468;
+
+static int noise(int spread)
+{
+    rng_state = rng_state * 1103515245u + 12345u;
+    return (int)((rng_state >> 16) % (unsigned int)(spread * 2 + 1)) - spread;
+}
+
+static int clamp_byte(int value)
+{
+    if (value < 0)
+        return 0;
+    return value > 255 ? 255 : value;
+}
+
+static unsigned int rgb(int r, int g, int b)
+{
+    return 0xFF000000u
+           | ((unsigned int)clamp_byte(b) << 16)
+           | ((unsigned int)clamp_byte(g) << 8)
+           | (unsigned int)clamp_byte(r);
+}
+
+void build_textures(void)
+{
+    int x, y;
+
+    for (y = 0; y < TEX_SIZE; y++)
+    {
+        for (x = 0; x < TEX_SIZE; x++)
+        {
+            int i = y * TEX_SIZE + x;
+
+            /* Cardboard: corrugation stripes, speckle, and a darker rim so
+             * every box face reads as a panel with edges. */
+            int n = noise(10);
+            int stripe = (y % 8 == 0) ? -18 : 0;
+            int edge = (x < 2 || y < 2 || x > TEX_SIZE - 3 || y > TEX_SIZE - 3) ? -45 : 0;
+            tex_cardboard[i] = rgb(172 + n + stripe + edge,
+                                   132 + n + stripe + edge,
+                                   88 + n + stripe + edge);
+
+            /* Concrete: fine grain with expansion joints on a 32px grid. */
+            n = noise(12);
+            int joint = (x % 32 == 0 || y % 32 == 0) ? -28 : 0;
+            tex_concrete[i] = rgb(118 + n + joint, 118 + n + joint, 120 + n + joint);
+
+            /* Metal: vertical brushing plus a highlight every 16px. */
+            n = noise(8);
+            int brush = ((x * 7) % 16 < 2) ? 16 : 0;
+            tex_metal[i] = rgb(92 + n + brush, 104 + n + brush, 126 + n + brush);
+        }
+    }
+
+    /* The GE reads textures straight from RAM. */
+    sceKernelDcacheWritebackAll();
+}
+
+void set_texture(const void *texture)
+{
+    sceGuTexImage(0, TEX_SIZE, TEX_SIZE, TEX_SIZE, texture);
+}
+
+/* Textured, colored world vertex. PSP vertex order is fixed: texture,
+ * then color, then position. */
 typedef struct
 {
+    float u, v;
     unsigned int color;
     float x, y, z;
 } VertexC;
@@ -291,48 +565,116 @@ static const float face_shade[6] = {0.72f, 0.62f, 0.66f, 0.80f, 1.00f, 0.45f};
 /* Emits the shared cube already positioned and colored, so the model matrix
  * stays identity and no per-object matrix upload is needed. Vertices come
  * from the display list via sceGuGetMemory, which sidesteps cache writeback. */
-void draw_box_shaded(float x, float y, float z, float sx, float sy, float sz,
-                      unsigned int color, float light, int shade_faces)
+void draw_box_rotated(float x, float y, float z, float sx, float sy, float sz,
+                       unsigned int color, float light, int shade_faces, float angle)
 {
     VertexC *v = (VertexC *)sceGuGetMemory(CUBE_VERT_COUNT * sizeof(VertexC));
+
+    /* The color only changes per face, so resolve it six times rather than
+     * once per vertex. */
+    unsigned int face_color[6];
+    int f;
+    for (f = 0; f < 6; f++)
+        face_color[f] = scale_color(color, shade_faces ? face_shade[f] * light : light);
+
+    /* UVs are derived from the object's world size so texel density stays
+     * constant: a long wall tiles the texture instead of stretching it. */
+    float us = sx / TEX_WORLD, vs = sy / TEX_WORLD, ws = sz / TEX_WORLD;
 
     unsigned int i;
     for (i = 0; i < CUBE_VERT_COUNT; i++)
     {
-        float k = shade_faces ? face_shade[i / 6] * light : light;
-        v[i].color = scale_color(color, k);
-        v[i].x = cube_verts[i].x * sx + x;
-        v[i].y = cube_verts[i].y * sy + y;
-        v[i].z = cube_verts[i].z * sz + z;
+        float lx = cube_verts[i].x, ly = cube_verts[i].y, lz = cube_verts[i].z;
+
+        switch (i / 6)
+        {
+        case 0: /* front */
+        case 1: /* back */
+            v[i].u = (lx + 0.5f) * us;
+            v[i].v = ly * vs;
+            break;
+        case 2: /* left */
+        case 3: /* right */
+            v[i].u = (lz + 0.5f) * ws;
+            v[i].v = ly * vs;
+            break;
+        default: /* top and bottom */
+            v[i].u = (lx + 0.5f) * us;
+            v[i].v = (lz + 0.5f) * ws;
+            break;
+        }
+
+        v[i].color = face_color[i / 6];
+
+        float ox = lx * sx, oz = lz * sz;
+        if (angle != 0.0f)
+            rotate_y(ox, oz, angle, &ox, &oz);
+
+        v[i].x = ox + x;
+        v[i].y = ly * sy + y;
+        v[i].z = oz + z;
     }
 
-    sceGuDrawArray(GU_TRIANGLES, GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_3D,
+    sceGuDrawArray(GU_TRIANGLES,
+                    GU_TEXTURE_32BITF | GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_3D,
                     CUBE_VERT_COUNT, 0, v);
 }
 
-/* World objects are lit by the lamps above them. */
+void draw_box_shaded(float x, float y, float z, float sx, float sy, float sz,
+                      unsigned int color, float light, int shade_faces)
+{
+    draw_box_rotated(x, y, z, sx, sy, sz, color, light, shade_faces, 0.0f);
+}
+
+/* World objects are lit by the lamps and by the player's flashlight. */
 void draw_box(float x, float y, float z, float sx, float sy, float sz, unsigned int color)
 {
-    draw_box_shaded(x, y, z, sx, sy, sz, color, light_at(x, z), 1);
+    draw_box_shaded(x, y, z, sx, sy, sz, color, lit_level(x, z), 1);
 }
 
-/* Lamps and terminal screens emit rather than receive light. */
+/* Lamps and terminal screens emit rather than receive light, and a surface
+ * texture would only muddy them, so they draw untextured. */
 void draw_box_lit(float x, float y, float z, float sx, float sy, float sz, unsigned int color)
 {
+    sceGuDisable(GU_TEXTURE_2D);
     draw_box_shaded(x, y, z, sx, sy, sz, color, 1.0f, 0);
+    sceGuEnable(GU_TEXTURE_2D);
 }
 
-/* Floor lighting is baked per vertex and only rebuilt when a lamp changes,
- * so the pools of light cost nothing per frame. */
+/* The lamps' contribution to the floor is baked once per lamp change, since
+ * it never moves. The flashlight is added on top every frame. */
 #define FLOOR_COLOR 0xFF6A6A6A
 static VertexC __attribute__((aligned(16))) floor_verts[FLOOR_VERT_COUNT];
+static float floor_base_light[FLOOR_VERT_COUNT];
 
 static void put_floor_vertex(int n, float x, float z)
 {
-    floor_verts[n].color = scale_color(FLOOR_COLOR, light_at(x, z));
+    floor_base_light[n] = light_at(x, z);
+
+    floor_verts[n].u = x / TEX_WORLD;
+    floor_verts[n].v = z / TEX_WORLD;
+    floor_verts[n].color = scale_color(FLOOR_COLOR, floor_base_light[n]);
     floor_verts[n].x = x;
     floor_verts[n].y = FLOOR_Y;
     floor_verts[n].z = z;
+}
+
+/* Re-colors the floor for the flashlight's current position and heading.
+ * Vertices outside the cone's reach just get their baked color back, so the
+ * expensive part only runs for the few hundred vertices actually near the
+ * player. */
+void update_floor_lighting(void)
+{
+    int i;
+    for (i = 0; i < FLOOR_VERT_COUNT; i++)
+    {
+        float extra = flashlight_at(floor_verts[i].x, floor_verts[i].z);
+        float level = floor_base_light[i] + extra;
+        if (level > 1.0f)
+            level = 1.0f;
+        floor_verts[i].color = scale_color(FLOOR_COLOR, level);
+    }
+    sceKernelDcacheWritebackRange(floor_verts, sizeof(floor_verts));
 }
 
 void build_floor(void)
@@ -471,28 +813,46 @@ void draw_char(int x, int y, int scale, unsigned int color, char c)
         return;
 
     const unsigned char *glyph = font_data[idx];
-    int row, col, lit = 0;
+    int row, col;
 
+    /* Runs of lit pixels in a row become one quad instead of one each, which
+     * is roughly a third of the geometry for the same glyph. */
+    int runs = 0;
     for (row = 0; row < FONT_H; row++)
+    {
+        int in_run = 0;
         for (col = 0; col < FONT_W; col++)
-            if (glyph[row] & (1 << (FONT_W - 1 - col)))
-                lit++;
+        {
+            int on = glyph[row] & (1 << (FONT_W - 1 - col));
+            if (on && !in_run)
+                runs++;
+            in_run = on;
+        }
+    }
 
-    if (lit == 0)
+    if (runs == 0)
         return;
 
-    Vertex2D *v = (Vertex2D *)sceGuGetMemory(lit * 6 * sizeof(Vertex2D));
+    Vertex2D *v = (Vertex2D *)sceGuGetMemory(runs * 6 * sizeof(Vertex2D));
     int n = 0;
 
     for (row = 0; row < FONT_H; row++)
     {
-        for (col = 0; col < FONT_W; col++)
+        col = 0;
+        while (col < FONT_W)
         {
             if (!(glyph[row] & (1 << (FONT_W - 1 - col))))
+            {
+                col++;
                 continue;
+            }
 
-            short x0 = x + col * scale, y0 = y + row * scale;
-            short x1 = x0 + scale, y1 = y0 + scale;
+            int start = col;
+            while (col < FONT_W && (glyph[row] & (1 << (FONT_W - 1 - col))))
+                col++;
+
+            short x0 = x + start * scale, y0 = y + row * scale;
+            short x1 = x + col * scale, y1 = y0 + scale;
 
             v[n].color = color; v[n].x = x0; v[n].y = y0; v[n].z = 0; n++;
             v[n].color = color; v[n].x = x1; v[n].y = y0; v[n].z = 0; n++;
@@ -504,7 +864,7 @@ void draw_char(int x, int y, int scale, unsigned int color, char c)
     }
 
     sceGuDrawArray(GU_TRIANGLES, GU_COLOR_8888 | GU_VERTEX_16BIT | GU_TRANSFORM_2D,
-                    lit * 6, 0, v);
+                    runs * 6, 0, v);
 }
 
 void draw_text(int x, int y, int scale, unsigned int color, const char *text)
@@ -617,8 +977,6 @@ static GameState state = STATE_MENU;
 static int menu_selection = 0;
 
 /* Player state lives here so the state machine can reset it. */
-static float player_x = 0.0f;
-static float player_z = 6.0f;
 static int carrying = -1; /* -1 = empty-handed, else BoxType */
 
 int order_is_complete(void)
@@ -647,7 +1005,14 @@ typedef struct
     int active; /* 0 once picked up */
 } Box;
 
-static const float box_size[] = {0.7f, 0.55f, 0.4f};
+/* Every box is the same crate. The type is only readable from the colored
+ * label on it, and the label only shows once there is light on it, so a
+ * dark aisle has to actually be searched instead of scanned from the door.
+ * Different sizes per type would give the game away from across the room. */
+#define BOX_SIZE 0.55f
+#define BOX_IDENTIFY_LIGHT 0.3f
+#define BOX_CARDBOARD 0xFF6A94C0
+
 static const unsigned int box_color[] = {0xFF2040D0, 0xFF30C040, 0xFFD0C020};
 
 /* Spots in the aisles where stock can sit: clear of the shelving, the
@@ -671,6 +1036,19 @@ static const float spawn_z[] = {
 
 static Box boxes[MAX_BOXES];
 static int box_count = 0;
+
+/* Spare batteries lying around the warehouse. Picked up by walking into
+ * them rather than with X, so they never compete with grabbing a box. */
+#define BATTERY_COUNT 3
+#define BATTERY_PICKUP_RANGE 0.8f
+
+typedef struct
+{
+    float x, z;
+    int active;
+} Battery;
+
+static Battery batteries[BATTERY_COUNT];
 
 /* Transient on-screen message, used by the shift's small unexplained events. */
 static const char *message_line1 = NULL;
@@ -737,6 +1115,74 @@ void restock_warehouse(int index)
         boxes[box_count].active = 1;
         box_count++;
     }
+
+    /* Fresh batteries each order, on spawn points the stock didn't take,
+     * walking backwards through the list so they land away from the boxes. */
+    int b;
+    for (b = 0; b < BATTERY_COUNT; b++)
+    {
+        int point = (SPAWN_POINT_COUNT - 1 - (index * 2 + b * 5)) % SPAWN_POINT_COUNT;
+        if (point < 0)
+            point += SPAWN_POINT_COUNT;
+
+        batteries[b].x = spawn_x[point];
+        batteries[b].z = spawn_z[point];
+        batteries[b].active = 1;
+    }
+}
+
+/* Lamps trip on their own through the shift. Resetting them costs a walk to
+ * the breaker, so there is a standing choice between spending time on light
+ * and just working the aisles dark. */
+#define BREAKER_X -9.3f
+#define BREAKER_Z 2.0f
+#define BREAKER_RANGE 1.3f
+#define LAMP_TRIP_INTERVAL 38.0f
+
+static float lamp_trip_timer = LAMP_TRIP_INTERVAL;
+
+void trip_random_lamp(void)
+{
+    int candidates[LAMP_COUNT];
+    int n = 0, i;
+
+    for (i = 0; i < LAMP_COUNT; i++)
+        if (lamp_on[i])
+            candidates[n++] = i;
+
+    /* Never leave the room completely black; that isn't tension, just a
+     * dead end with a dying flashlight. */
+    if (n <= 1)
+        return;
+
+    int pick = candidates[(noise(1000) + 1000) % n];
+    lamp_on[pick] = 0;
+    build_floor();
+
+    play_sound(snd_horror);
+    show_message("BREAKER TRIPPED", "RESET PANEL ON WEST WALL", 3.5f);
+}
+
+void reset_breaker(void)
+{
+    int i, restored = 0;
+    for (i = 0; i < LAMP_COUNT; i++)
+    {
+        if (!lamp_on[i] && !lamp_dead[i])
+        {
+            lamp_on[i] = 1;
+            restored++;
+        }
+    }
+
+    if (restored)
+    {
+        build_floor();
+        play_sound(snd_deliver);
+        show_message("POWER RESTORED", "", 2.0f);
+    }
+    else
+        play_sound(snd_click);
 }
 
 /* Nothing chases the player and nothing jumps out; the shift just stops
@@ -746,8 +1192,8 @@ void apply_shift_events(int index)
     if (index >= 2)
     {
         lamp_on[0] = 0;
-        lamp_on[4] = 0;
-        build_floor(); /* rebake the light pools without those lamps */
+        lamp_dead[0] = 1; /* this one the breaker won't bring back */
+        build_floor();    /* rebake the light pools without that lamp */
     }
     if (index >= 3)
         extra_box_present = 1;
@@ -813,7 +1259,7 @@ int check_collision(float x, float z)
         Box *b = &boxes[i];
         if (!b->active)
             continue;
-        float half = box_size[b->type] * 0.5f;
+        float half = BOX_SIZE * 0.5f;
         float min_x = b->x - half, max_x = b->x + half;
         float min_z = b->z - half, max_z = b->z + half;
 
@@ -830,14 +1276,23 @@ int check_collision(float x, float z)
 
 void draw_boxes(void)
 {
+    set_texture(tex_cardboard);
+
     int i;
     for (i = 0; i < box_count; i++)
     {
         Box *b = &boxes[i];
         if (!b->active)
             continue;
-        float size = box_size[b->type];
-        draw_box(b->x, FLOOR_Y, b->z, size, size, size, box_color[b->type]);
+
+        draw_box(b->x, FLOOR_Y, b->z, BOX_SIZE, BOX_SIZE, BOX_SIZE, BOX_CARDBOARD);
+
+        /* The label is what names the box, and it needs light to be read. */
+        float light = lit_level(b->x, b->z);
+        if (light >= BOX_IDENTIFY_LIGHT)
+            draw_box_shaded(b->x, FLOOR_Y + BOX_SIZE * 0.55f, b->z,
+                             BOX_SIZE * 1.02f, BOX_SIZE * 0.22f, BOX_SIZE * 1.02f,
+                             box_color[b->type], light, 1);
     }
 }
 
@@ -847,7 +1302,9 @@ void draw_floor(void)
     sceGumLoadIdentity();
     sceGumUpdateMatrix();
 
-    sceGuDrawArray(GU_TRIANGLES, GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_3D,
+    set_texture(tex_concrete);
+    sceGuDrawArray(GU_TRIANGLES,
+                    GU_TEXTURE_32BITF | GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_3D,
                     FLOOR_VERT_COUNT, 0, floor_verts);
 }
 
@@ -875,6 +1332,20 @@ void draw_wall_along_z(float x, unsigned int color)
     {
         float cz = -10.0f + WALL_SEGMENT * (i + 0.5f);
         draw_box(x, FLOOR_Y, cz, WALL_THICKNESS, WALL_HEIGHT, WALL_SEGMENT, color);
+    }
+}
+
+void draw_batteries(void)
+{
+    int i;
+    for (i = 0; i < BATTERY_COUNT; i++)
+    {
+        if (!batteries[i].active)
+            continue;
+
+        /* Drawn unlit so they stay findable in a dark aisle. */
+        draw_box_lit(batteries[i].x, FLOOR_Y, batteries[i].z,
+                     0.16f, 0.34f, 0.16f, 0xFF30D0D0);
     }
 }
 
@@ -935,9 +1406,12 @@ void draw_warehouse(void)
 {
     draw_floor();
 
+    set_texture(tex_concrete);
     draw_wall_along_x(-10.0f, 0xFF806040);
     draw_wall_along_z(-10.0f, 0xFF806040);
     draw_wall_along_z(10.0f, 0xFF806040);
+
+    set_texture(tex_metal);
 
     /* loading zone marker, slightly raised to avoid z-fighting with the floor.
      * Colors are ABGR here, so this is gold rather than the cyan the same
@@ -960,6 +1434,17 @@ void draw_warehouse(void)
             draw_box(lamp_x[i], 4.3f, lamp_z[i], 1.2f, 0.15f, 1.2f, 0xFF303030);
     }
 
+    /* Breaker panel on the west wall, with a status light that goes red
+     * while anything is tripped so it's findable from across the room. */
+    int tripped = 0;
+    for (i = 0; i < LAMP_COUNT; i++)
+        if (!lamp_on[i] && !lamp_dead[i])
+            tripped = 1;
+
+    draw_box(BREAKER_X, FLOOR_Y + 0.8f, BREAKER_Z, 0.25f, 1.0f, 0.9f, 0xFF4A4A52);
+    draw_box_lit(BREAKER_X - 0.1f, FLOOR_Y + 1.45f, BREAKER_Z, 0.08f, 0.14f, 0.14f,
+                 tripped ? 0xFF3030E0 : 0xFF40D040);
+
     /* Terminal: cabinet plus a screen that turns red when it starts
      * printing things nobody typed. */
     draw_box(TERMINAL_X, FLOOR_Y, TERMINAL_Z, 1.0f, 1.2f, 0.6f, 0xFF404048);
@@ -967,18 +1452,60 @@ void draw_warehouse(void)
                  terminal_glitched ? 0xFF2020D0 : 0xFF60D060);
 }
 
-/* Simple low-poly placeholder player: body + head, facing -Z.
- * If carrying a box (carrying >= 0), shows a small floating indicator above the head. */
-void draw_player(float x, float y, float z, int carrying)
+/* Low-poly worker built from boxes: torso, head, two arms and two legs,
+ * turned to face the direction of travel. Limbs swing from the walk phase,
+ * arms opposite the legs, and the whole body bobs slightly in step. */
+void draw_player(float y, int carrying)
 {
-    draw_box(x, y, z, 0.6f, 1.0f, 0.4f, 0xFF3050A0);
-    draw_box(x, y + 1.0f, z, 0.4f, 0.4f, 0.4f, 0xFFC09060);
+    /* Places a body part given in local space (X right, Z forward = -Z). */
+    #define PART(lx, ly, lz, sx, sy, sz, col)                                  \
+        do {                                                                   \
+            float wx, wz;                                                      \
+            rotate_y((lx), (lz), player_angle, &wx, &wz);                      \
+            draw_box_rotated(player_x + wx, (ly), player_z + wz,               \
+                              (sx), (sy), (sz), (col),                         \
+                              lit_level(player_x, player_z), 1, player_angle); \
+        } while (0)
 
+    float swing = sinf(walk_phase) * 0.22f * walk_amount;
+    float bob = sinf(walk_phase * 2.0f) * 0.035f * walk_amount;
+
+    set_texture(tex_metal);
+
+    /* legs */
+    PART(-0.13f, y + bob, swing, 0.16f, 0.45f, 0.16f, 0xFF503828);
+    PART(0.13f, y + bob, -swing, 0.16f, 0.45f, 0.16f, 0xFF503828);
+
+    /* torso and head */
+    PART(0.0f, y + 0.45f + bob, 0.0f, 0.48f, 0.62f, 0.30f, 0xFF3050A0);
+    PART(0.0f, y + 1.07f + bob, 0.0f, 0.30f, 0.28f, 0.28f, 0xFFA08058);
+
+    /* arms swing opposite the legs */
+    PART(-0.31f, y + 0.52f + bob, -swing, 0.13f, 0.50f, 0.13f, 0xFF2A4488);
+    PART(0.31f, y + 0.52f + bob, swing, 0.13f, 0.50f, 0.13f, 0xFF2A4488);
+
+    /* Flashlight in the right hand, pointing the way the body faces. The
+     * lens is drawn unlit so it reads as the thing emitting the beam. */
+    float hand_z = swing - 0.18f;
+    PART(0.31f, y + 0.42f + bob, hand_z, 0.11f, 0.11f, 0.34f, 0xFF303038);
+
+    if (flashlight_power() > 0.0f)
+    {
+        float wx, wz;
+        rotate_y(0.31f, hand_z - 0.20f, player_angle, &wx, &wz);
+        draw_box_lit(player_x + wx, y + 0.42f + bob, player_z + wz,
+                     0.13f, 0.13f, 0.06f, 0xFF90E8FF);
+    }
+
+    /* The carried box is held in front of the chest rather than floating. */
     if (carrying >= 0)
     {
-        float size = 0.3f;
-        draw_box(x, y + 1.6f, z, size, size, size, box_color[carrying]);
+        float size = BOX_SIZE * 0.8f;
+        set_texture(tex_cardboard);
+        PART(0.0f, y + 0.55f + bob, -0.38f, size, size, size, box_color[carrying]);
     }
+
+    #undef PART
 }
 
 #define ANALOG_DEADZONE 0.25f
@@ -998,8 +1525,17 @@ void update_input(void)
     prev_buttons = pad.Buttons;
 }
 
-/* Reads the analog stick and moves the player, sliding along obstacles. */
-void update_player(float *player_x, float *player_z)
+#define TURN_RATE 9.0f
+#define SPRINT_MULTIPLIER 1.75f
+#define STAMINA_DRAIN 0.28f
+#define STAMINA_RECOVER 0.18f
+
+static float stamina = 1.0f;
+static int sprint_locked = 0; /* forces a rest once stamina bottoms out */
+
+/* Reads the analog stick, moves the player, turns them to face where they
+ * are going and advances the walk cycle. */
+void update_player(void)
 {
     float move_x = (pad.Lx - 128) / 128.0f;
     float move_z = (pad.Ly - 128) / 128.0f;
@@ -1009,14 +1545,91 @@ void update_player(float *player_x, float *player_z)
     if (move_z > -ANALOG_DEADZONE && move_z < ANALOG_DEADZONE)
         move_z = 0.0f;
 
-    /* Resolve each axis separately so the player slides along walls/crates. */
-    float new_x = *player_x + move_x * MOVE_SPEED * FRAME_DT;
-    if (!check_collision(new_x, *player_z))
-        *player_x = new_x;
+    float speed = sqrtf(move_x * move_x + move_z * move_z);
+    if (speed > 1.0f)
+        speed = 1.0f;
 
-    float new_z = *player_z + move_z * MOVE_SPEED * FRAME_DT;
-    if (!check_collision(*player_x, new_z))
-        *player_z = new_z;
+    if (speed > 0.0f)
+    {
+        /* Turn toward the heading by the shortest way round rather than
+         * snapping, so direction changes read as the body pivoting. */
+        float target = atan2f(move_x, -move_z);
+        float diff = target - player_angle;
+        while (diff > PI)
+            diff -= 2.0f * PI;
+        while (diff < -PI)
+            diff += 2.0f * PI;
+
+        float step = diff * TURN_RATE * FRAME_DT;
+        if ((diff > 0.0f && step > diff) || (diff < 0.0f && step < diff))
+            step = diff;
+        player_angle += step;
+
+        walk_phase += speed * 9.0f * FRAME_DT;
+    }
+
+    /* Sprint on R, but only while there's stamina and after a full rest if
+     * it ever ran dry, so mashing it isn't a free speed boost. */
+    int wants_sprint = (pad.Buttons & PSP_CTRL_RTRIGGER) && speed > 0.0f;
+    int sprinting = wants_sprint && !sprint_locked && stamina > 0.0f;
+
+    if (sprinting)
+    {
+        stamina -= STAMINA_DRAIN * FRAME_DT;
+        if (stamina <= 0.0f)
+        {
+            stamina = 0.0f;
+            sprint_locked = 1;
+        }
+    }
+    else
+    {
+        stamina += STAMINA_RECOVER * FRAME_DT;
+        if (stamina > 1.0f)
+            stamina = 1.0f;
+        if (stamina > 0.35f)
+            sprint_locked = 0;
+    }
+
+    float pace = sprinting ? SPRINT_MULTIPLIER : 1.0f;
+
+    /* Ease the animation weight so stopping doesn't freeze mid-stride. */
+    walk_amount += (speed * pace - walk_amount) * 0.2f;
+
+    /* Resolve each axis separately so the player slides along walls/crates. */
+    float new_x = player_x + move_x * MOVE_SPEED * pace * FRAME_DT;
+    if (!check_collision(new_x, player_z))
+        player_x = new_x;
+
+    float new_z = player_z + move_z * MOVE_SPEED * pace * FRAME_DT;
+    if (!check_collision(player_x, new_z))
+        player_z = new_z;
+
+    /* Batteries are collected by walking over them. */
+    int i;
+    for (i = 0; i < BATTERY_COUNT; i++)
+    {
+        if (!batteries[i].active)
+            continue;
+
+        float dx = player_x - batteries[i].x;
+        float dz = player_z - batteries[i].z;
+        if (dx * dx + dz * dz < BATTERY_PICKUP_RANGE * BATTERY_PICKUP_RANGE)
+        {
+            batteries[i].active = 0;
+            flashlight_charge = 1.0f;
+            play_sound(snd_battery);
+        }
+    }
+
+    /* The flashlight only drains while it is actually lit, which is what
+     * makes switching it off in a lit aisle worth doing. */
+    if (flashlight_on && flashlight_charge > 0.0f)
+    {
+        flashlight_charge -= FLASH_DRAIN * FRAME_DT;
+        if (flashlight_charge < 0.0f)
+            flashlight_charge = 0.0f;
+    }
 }
 
 /* X delivers the carried box if standing in the loading zone, otherwise
@@ -1026,6 +1639,14 @@ void update_interact(float player_x, float player_z, int *carrying)
 {
     if (!(buttons_pressed & PSP_CTRL_CROSS))
         return;
+
+    float breaker_dx = player_x - BREAKER_X;
+    float breaker_dz = player_z - BREAKER_Z;
+    if (breaker_dx * breaker_dx + breaker_dz * breaker_dz < BREAKER_RANGE * BREAKER_RANGE)
+    {
+        reset_breaker();
+        return;
+    }
 
     float zone_dx = player_x - LOADING_ZONE_X;
     float zone_dz = player_z - LOADING_ZONE_Z;
@@ -1153,6 +1774,22 @@ void draw_hud(void)
     draw_rect_2d(TIMER_BAR_X, TIMER_BAR_Y,
                  (int)(TIMER_BAR_W * fraction), TIMER_BAR_H,
                  fraction > 0.3f ? 0xFF40C040 : 0xFF4040E0);
+
+    /* Battery and stamina, stacked under the clock. */
+    int bar_y = TIMER_BAR_Y + TIMER_BAR_H + 6;
+    draw_text(TIMER_BAR_X - 34, bar_y - 1, 1, 0xFF909090, "BAT");
+    draw_rect_2d(TIMER_BAR_X - 2, bar_y - 2, TIMER_BAR_W + 4, TIMER_BAR_H + 4, 0xFF101010);
+    draw_rect_2d(TIMER_BAR_X, bar_y, (int)(TIMER_BAR_W * flashlight_charge), TIMER_BAR_H,
+                 flashlight_charge > 0.25f ? 0xFF30D0D0 : 0xFF4040E0);
+
+    bar_y += TIMER_BAR_H + 6;
+    draw_text(TIMER_BAR_X - 34, bar_y - 1, 1, 0xFF909090, "RUN");
+    draw_rect_2d(TIMER_BAR_X - 2, bar_y - 2, TIMER_BAR_W + 4, TIMER_BAR_H + 4, 0xFF101010);
+    draw_rect_2d(TIMER_BAR_X, bar_y, (int)(TIMER_BAR_W * stamina), TIMER_BAR_H,
+                 sprint_locked ? 0xFF4060A0 : 0xFFC0C060);
+
+    if (flashlight_charge <= 0.0f)
+        draw_text_centered(SCR_HEIGHT - 60, 1, 0xFF4040E0, "FLASHLIGHT DEAD - FIND A BATTERY");
 }
 
 /* Triangle holds the full order card up on screen. */
@@ -1257,11 +1894,23 @@ void reset_game(void)
     carrying = -1;
     player_x = 0.0f;
     player_z = 6.0f;
+    player_angle = 0.0f;
+    walk_phase = 0.0f;
+    walk_amount = 0.0f;
+    stamina = 1.0f;
+    sprint_locked = 0;
+    flashlight_on = 1;
+    flashlight_charge = 1.0f;
+    ambient_intensity = 1.0f;
 
     /* The warehouse starts each shift intact, lights and all. */
     int i;
     for (i = 0; i < LAMP_COUNT; i++)
+    {
         lamp_on[i] = 1;
+        lamp_dead[i] = 0;
+    }
+    lamp_trip_timer = LAMP_TRIP_INTERVAL;
     build_floor();
     terminal_glitched = 0;
     extra_box_present = 0;
@@ -1275,15 +1924,23 @@ int main(void)
     setup_callbacks();
     init_graphics();
     audio_init();
+    build_textures();
     build_floor();
     start_order(0);
     sceCtrlSetSamplingCycle(0);
     sceCtrlSetSamplingMode(PSP_CTRL_MODE_ANALOG);
 
-    /* Third-person camera: fixed offset above and behind the player. */
+    /* Third-person camera: fixed angle, trailing the player. The angle stays
+     * world-aligned on purpose. Movement is world-relative, so a camera that
+     * swung around with the player would keep redefining which way "up" on
+     * the stick means. */
     const float cam_height = 3.5f;
     const float cam_distance = 5.0f;
     const float player_y = FLOOR_Y;
+    #define CAM_LAG 0.12f
+
+    float cam_follow_x = player_x;
+    float cam_follow_z = player_z;
 
     ScePspFVector3 cam_up = {0.0f, 1.0f, 0.0f};
 
@@ -1318,8 +1975,24 @@ int main(void)
             break;
 
         case STATE_PLAYING:
-            update_player(&player_x, &player_z);
+            update_player();
             update_interact(player_x, player_z, &carrying);
+
+            if (buttons_pressed & PSP_CTRL_CIRCLE)
+            {
+                flashlight_on = !flashlight_on;
+                play_sound(snd_click);
+            }
+
+            /* The drone tightens as the shift wears on. */
+            ambient_intensity = 1.0f + order_index * 0.22f;
+
+            lamp_trip_timer -= FRAME_DT;
+            if (lamp_trip_timer <= 0.0f)
+            {
+                trip_random_lamp();
+                lamp_trip_timer = LAMP_TRIP_INTERVAL;
+            }
 
             time_left -= FRAME_DT;
             if (time_left < 0.0f)
@@ -1383,19 +2056,36 @@ int main(void)
          * this range covers the whole room with room to spare. */
         sceGumPerspective(60.0f, 480.0f / 272.0f, 1.0f, 100.0f);
 
-        ScePspFVector3 cam_pos = {player_x, player_y + cam_height, player_z + cam_distance};
+        /* The camera trails the player instead of being welded to them, so
+         * starting and stopping has a little weight to it. */
+        cam_follow_x += (player_x - cam_follow_x) * CAM_LAG;
+        cam_follow_z += (player_z - cam_follow_z) * CAM_LAG;
+
+        float bob = sinf(walk_phase * 2.0f) * 0.06f * walk_amount;
+
+        ScePspFVector3 cam_pos = {cam_follow_x, player_y + cam_height + bob,
+                                   cam_follow_z + cam_distance};
         ScePspFVector3 cam_target = {player_x, player_y + 1.0f, player_z};
 
         sceGumMatrixMode(GU_VIEW);
         sceGumLoadIdentity();
         sceGumLookAt(&cam_pos, &cam_target, &cam_up);
 
+        update_floor_lighting();
+
         draw_warehouse();
         draw_boxes();
-        draw_player(player_x, player_y, player_z, carrying);
+        draw_batteries();
+        draw_player(player_y, carrying);
 
-        /* All 2D overlays share one depth-test-off block. */
+        /* The 2D overlays are flat colored quads: no depth, no texture and
+         * no fog, all of which belong to the world pass only. Culling goes
+         * too, because screen space has Y pointing down, which makes these
+         * quads wind the opposite way from the world's front faces. */
         sceGuDisable(GU_DEPTH_TEST);
+        sceGuDisable(GU_TEXTURE_2D);
+        sceGuDisable(GU_FOG);
+        sceGuDisable(GU_CULL_FACE);
 
         switch (state)
         {
@@ -1422,6 +2112,9 @@ int main(void)
         }
 
         sceGuEnable(GU_DEPTH_TEST);
+        sceGuEnable(GU_TEXTURE_2D);
+        sceGuEnable(GU_FOG);
+        sceGuEnable(GU_CULL_FACE);
 
         sceGuFinish();
         sceGuSync(0, 0);
