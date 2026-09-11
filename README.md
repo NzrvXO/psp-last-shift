@@ -1,8 +1,8 @@
 # LAST SHIFT
 
-Пет-проект: 3D-игра для Sony PSP, написанная с нуля на C поверх нативного PSP SDK. Без движка, без сторонних библиотек и без единого файла ресурсов — текстуры, шрифт, звук и музыка генерируются кодом при запуске.
+Проект: 3D-игра для Sony PSP, написанная с нуля на C поверх нативного PSP SDK. Без движка, без сторонних библиотек и без единого файла ресурсов — текстуры, шрифт, звук и музыка генерируются кодом при запуске.
 
-A pet project: a 3D game for the Sony PSP written from scratch in C on the native PSP SDK. No engine, no third-party libraries and no asset files — textures, font, sound and music are all generated in code at startup.
+A Project: a 3D game for the Sony PSP written from scratch in C on the native PSP SDK. No engine, no third-party libraries and no asset files — textures, font, sound and music are all generated in code at startup.
 
 **[Русский](#русский)** · **[English](#english)**
 
