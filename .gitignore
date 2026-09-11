@@ -61,3 +61,6 @@ EBOOT.PBP
 PARAM.SFO
 *.prx
 *.sfo
+
+# Original specification, kept locally
+prompt.md
